@@ -21,9 +21,9 @@ from configobj import ConfigObj
 from clusterdock.models import Cluster, client, Node
 from clusterdock.utils import nested_get, wait_for_condition
 
-from .cm import ClouderaManagerDeployment
+from topology_cdh import cm
 
-DEFAULT_NAMESPACE = 'cloudera'
+DEFAULT_NAMESPACE = 'streamsets'
 
 CM_PORT = 7180
 HUE_PORT = 8888
@@ -53,6 +53,9 @@ KUDU_PARCEL_VERSIONS = {'1.2.0': '5.10.0',
                         '1.3.0': '5.11.0',
                         '1.4.0': '5.12.0'}
 
+SDC_PARCEL_REPO_URL = 'https://archives.streamsets.com/datacollector/{}/parcel/'
+SDC_PORT = 18630
+
 logger = logging.getLogger('clusterdock.{}'.format(__name__))
 
 
@@ -77,6 +80,9 @@ def main(args):
     ports = [{CM_PORT: CM_PORT} if args.predictable else CM_PORT,
              {HUE_PORT: HUE_PORT} if args.predictable else HUE_PORT]
 
+    if args.sdc_version:
+        ports.append({SDC_PORT: SDC_PORT} if args.predictable else SDC_PORT)
+
     primary_node = Node(hostname=args.primary_node[0], group='primary',
                         image=primary_node_image, ports=ports,
                         healthcheck=cm_server_healthcheck)
@@ -86,7 +92,7 @@ def main(args):
 
     if args.java:
         java_image = '{}/{}/clusterdock:cdh_{}'.format(args.registry,
-                                                       args.namespace,
+                                                       args.namespace or DEFAULT_NAMESPACE,
                                                        args.java)
         for node in nodes:
             node.volumes.append(java_image)
@@ -98,6 +104,16 @@ def main(args):
         logger.debug('Adding Spark2 parcel image %s to CM nodes ...', spark2_parcel_image)
         for node in nodes:
             node.volumes.append(spark2_parcel_image)
+
+    if args.sdc_version:
+        sdc_parcel_image = ('{}/{}/clusterdock:topology_cdh-'
+                            'streamsets_datacollector-{}').format(args.registry,
+                                                                  args.namespace
+                                                                  or DEFAULT_NAMESPACE,
+                                                                  args.sdc_version)
+        logger.debug('Adding SDC parcel image %s to CM nodes ...', sdc_parcel_image)
+        for node in nodes:
+            node.volumes.append(sdc_parcel_image)
 
     if args.kerberos:
         kerberos_config_host_dir = os.path.expanduser(args.kerberos_config_directory)
@@ -174,7 +190,7 @@ def main(args):
     logger.info('Cloudera Manager server is now reachable at %s', server_url)
 
     # The work we need to do through CM itself begins here...
-    deployment = ClouderaManagerDeployment(server_url)
+    deployment = cm.ClouderaManagerDeployment(server_url)
     cm_cluster = deployment.cluster(DEFAULT_CLUSTER_NAME)
     cdh_parcel = next(parcel for parcel in cm_cluster.parcels
                       if parcel.product == 'CDH' and parcel.stage in ('ACTIVATING',
@@ -229,6 +245,33 @@ def main(args):
 
     if args.spark2_version:
         _install_service_from_local_repo(deployment, cluster, product='SPARK2', prefix='SPARK2')
+
+    if args.sdc_version:
+        product = 'STREAMSETS_DATACOLLECTOR'
+        sdc_parcel = cm_cluster.parcel(product=product, version=args.sdc_version)
+
+        # After we set CM's "Manage Parcels" config to False, the SDC parcel becomes
+        # undistributed. After this, we may need to add the SDC parcel repo URL in order
+        # to be able to re-activate it.
+        try:
+            sdc_parcel.wait_for_stage('AVAILABLE_REMOTELY')
+        except cm.ParcelNotFoundError:
+            for config in deployment.get_cm_config():
+                if config['name'] == 'REMOTE_PARCEL_REPO_URLS':
+                    break
+            else:
+                raise Exception('Failed to find remote parcel repo URLs configuration.')
+            parcel_repo_urls = config['value']
+
+            sdc_parcel_repo_url = SDC_PARCEL_REPO_URL.format(args.sdc_version)
+            logger.debug('Adding SDC parcel repo URL (%s) ...', sdc_parcel_repo_url)
+            remote_parcel_repo_urls = '{},{}'.format(parcel_repo_urls, sdc_parcel_repo_url)
+            deployment.update_cm_config({'REMOTE_PARCEL_REPO_URLS': remote_parcel_repo_urls})
+
+            logger.debug('Refreshing parcel repos ...')
+            deployment.refresh_parcel_repos()
+
+        sdc_parcel.download().distribute().activate()
 
     if args.include_services:
         if args.exclude_services:
@@ -718,6 +761,17 @@ def _configure_kudu(deployment, cluster, kudu_version):
                                                                service['name'],
                                                                role_config_group['name'],
                                                                configs)
+
+
+def _configure_sdc(deployment, cluster, sdc_version):
+    logger.info('Adding StreamSets service to cluster (%s) ...', DEFAULT_CLUSTER_NAME)
+    datacollector_role = {'type': 'DATACOLLECTOR',
+                          'hostRef': {'hostId': cluster.primary_node.host_id}}
+    deployment.create_cluster_services(cluster_name=DEFAULT_CLUSTER_NAME,
+                                       services=[{'name': 'streamsets',
+                                                  'type': 'STREAMSETS',
+                                                  'displayName': 'StreamSets',
+                                                  'roles': [datacollector_role]}])
 
 
 def _set_cm_server_java_home(node, java_home):
