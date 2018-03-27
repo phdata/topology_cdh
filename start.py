@@ -46,6 +46,15 @@ KDC_KEYTAB_FILENAME = '{}/clusterdock.keytab'.format(KERBEROS_CONFIG_CONTAINER_D
 KDC_KRB5_CONF_FILENAME = '/etc/krb5.conf'
 LINUX_USER_ID_START = 1000
 
+# JAAS configuration for SDC to connect to Kerberized Kafka.
+JAAS_CONFIG = """KafkaClient {{
+    com.sun.security.auth.module.Krb5LoginModule required
+    useKeyTab=true
+    keyTab="_KEYTAB_PATH"
+    principal="{0}";
+}};"""
+JAAS_CONFIG_FILE_PATH = '/etc/kafka/kafka_client_jaas.conf'
+
 KUDU_PARCEL_VERSION_REGEX = r'(.*)-.*\.cdh(.*)\.p'
 KAFKA_PARCEL_REPO_URL = 'https://archive.cloudera.com/kafka/parcels'
 KUDU_PARCEL_REPO_URL = 'https://archive.cloudera.com/kudu/parcels'
@@ -333,6 +342,10 @@ def main(args):
     if args.kudu_version:
         logger.info('Configuring Kudu ...')
         _configure_kudu(deployment, cluster, kudu_version=args.kudu_version)
+
+    if args.sdc_version:
+        logger.info('Configuring StreamSets Data Collector ...')
+        _configure_sdc(deployment, cluster, sdc_version=args.sdc_version, is_kerberos_enabled=args.kerberos)
 
     if args.kerberos:
         logger.info('Configure Cloudera Manager for Kerberos ...')
@@ -763,7 +776,7 @@ def _configure_kudu(deployment, cluster, kudu_version):
                                                                configs)
 
 
-def _configure_sdc(deployment, cluster, sdc_version):
+def _configure_sdc(deployment, cluster, sdc_version, is_kerberos_enabled):
     logger.info('Adding StreamSets service to cluster (%s) ...', DEFAULT_CLUSTER_NAME)
     datacollector_role = {'type': 'DATACOLLECTOR',
                           'hostRef': {'hostId': cluster.primary_node.host_id}}
@@ -772,6 +785,27 @@ def _configure_sdc(deployment, cluster, sdc_version):
                                                   'type': 'STREAMSETS',
                                                   'displayName': 'StreamSets',
                                                   'roles': [datacollector_role]}])
+    # When running an application on YARN, the Spark executor requires access to the spark-submit script located in
+    # the Spark installation directory. Default is directory specified by SPARK_HOME environment variable.
+    # Hence SPARK_HOME environment variable must be set before starting StreamSets Data Collector.
+    configs = {'sdc-env.sh_role_safety_valve': 'export SPARK_HOME=/opt/cloudera/parcels/CDH/lib/spark'}
+
+    if is_kerberos_enabled:
+        # Create JAAS config file on node-1. Needed to access kerberized Kafka.
+        primary_node = cluster.primary_node
+        sdc_principal = 'sdc/{kafka_node_name}@{realm}'.format(kafka_node_name=primary_node.fqdn,
+                                                               realm=cluster.network.upper())
+        primary_node.put_file(JAAS_CONFIG_FILE_PATH, JAAS_CONFIG.format(sdc_principal))
+        # Configure SDC to use the JAAS config file created above.
+        opts = '-Djava.security.auth.login.config={0} -Dsun.security.krb5.debug=true'.format(JAAS_CONFIG_FILE_PATH)
+        configs['java.opts'] = opts
+
+    for role_config_group in deployment.get_service_role_config_groups(DEFAULT_CLUSTER_NAME,
+                                                                       'streamsets'):
+        deployment.update_service_role_config_group_config(DEFAULT_CLUSTER_NAME,
+                                                           'streamsets',
+                                                           role_config_group['name'],
+                                                           configs)
 
 
 def _set_cm_server_java_home(node, java_home):
@@ -966,7 +1000,6 @@ def _validate_service_health(deployment, cluster_name):
     wait_for_condition(condition=condition, condition_args=[deployment, cluster_name],
                        time_between_checks=3, timeout=600, time_to_success=30,
                        success=success, failure=failure)
-
 
 
 def _configure_for_streamsets_before_start(deployment, cluster_name):
