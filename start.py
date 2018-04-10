@@ -62,7 +62,7 @@ KUDU_PARCEL_VERSIONS = {'1.2.0': '5.10.0',
                         '1.3.0': '5.11.0',
                         '1.4.0': '5.12.0'}
 
-SDC_PARCEL_REPO_URL = 'https://archives.streamsets.com/datacollector/{}/parcel/'
+DEFAULT_SDC_S3_BUCKET = 'archives.streamsets.com'
 SDC_PORT = 18630
 
 logger = logging.getLogger('clusterdock.{}'.format(__name__))
@@ -115,6 +115,7 @@ def main(args):
             node.volumes.append(spark2_parcel_image)
 
     if args.sdc_version:
+        logger.info('args.sdc_version = %s', args.sdc_version)
         sdc_parcel_image = ('{}/{}/clusterdock:topology_cdh-'
                             'streamsets_datacollector-{}').format(args.registry,
                                                                   args.namespace
@@ -256,33 +257,23 @@ def main(args):
         _install_service_from_local_repo(deployment, cluster, product='SPARK2', prefix='SPARK2')
 
     if args.sdc_version:
+        # We install StreamSets DataCollector using local repo /opt/cloudera/parcel-repo.
+        # Set file and folder permissions correctly.
+        commands = ['chown cloudera-scm:cloudera-scm /opt/cloudera/csd',
+                    'chown cloudera-scm:cloudera-scm /opt/cloudera/parcel-repo',
+                    'chown cloudera-scm:cloudera-scm /opt/cloudera/csd/STREAMSETS*.jar',
+                    'chmod 644 /opt/cloudera/csd/STREAMSETS*.jar',
+                    'chown cloudera-scm:cloudera-scm /opt/cloudera/parcel-repo/STREAMSETS_*']
+        primary_node.execute(' && '.join(commands))
+
+        # The parcel is already present. Hence just distribute and activate it after refresing parcel repos.
         product = 'STREAMSETS_DATACOLLECTOR'
+        deployment.refresh_parcel_repos()
+        deployment.cluster(DEFAULT_CLUSTER_NAME).parcels
         # Remove RC from version.
         version = args.sdc_version.rsplit('-RC')[0]
-        sdc_parcel = cm_cluster.parcel(product=product, version=version)
-
-        # After we set CM's "Manage Parcels" config to False, the SDC parcel becomes
-        # undistributed. After this, we may need to add the SDC parcel repo URL in order
-        # to be able to re-activate it.
-        try:
-            sdc_parcel.wait_for_stage('AVAILABLE_REMOTELY')
-        except cm.ParcelNotFoundError:
-            for config in deployment.get_cm_config():
-                if config['name'] == 'REMOTE_PARCEL_REPO_URLS':
-                    break
-            else:
-                raise Exception('Failed to find remote parcel repo URLs configuration.')
-            parcel_repo_urls = config['value']
-
-            sdc_parcel_repo_url = SDC_PARCEL_REPO_URL.format(args.sdc_version)
-            logger.debug('Adding SDC parcel repo URL (%s) ...', sdc_parcel_repo_url)
-            remote_parcel_repo_urls = '{},{}'.format(parcel_repo_urls, sdc_parcel_repo_url)
-            deployment.update_cm_config({'REMOTE_PARCEL_REPO_URLS': remote_parcel_repo_urls})
-
-            logger.debug('Refreshing parcel repos ...')
-            deployment.refresh_parcel_repos()
-
-        sdc_parcel.download().distribute().activate()
+        sdc_parcel = cm_cluster.parcel(product=product, version=version, stage='DOWNLOADED')
+        sdc_parcel.distribute().activate()
 
     if args.include_services:
         if args.exclude_services:
@@ -347,7 +338,7 @@ def main(args):
 
     if args.sdc_version:
         logger.info('Configuring StreamSets Data Collector ...')
-        _configure_sdc(deployment, cluster, sdc_version=args.sdc_version, is_kerberos_enabled=args.kerberos)
+        _configure_sdc(deployment, cluster, is_kerberos_enabled=args.kerberos)
 
     if args.kerberos:
         logger.info('Configure Cloudera Manager for Kerberos ...')
@@ -778,7 +769,7 @@ def _configure_kudu(deployment, cluster, kudu_version):
                                                                configs)
 
 
-def _configure_sdc(deployment, cluster, sdc_version, is_kerberos_enabled):
+def _configure_sdc(deployment, cluster, is_kerberos_enabled):
     logger.info('Adding StreamSets service to cluster (%s) ...', DEFAULT_CLUSTER_NAME)
     datacollector_role = {'type': 'DATACOLLECTOR',
                           'hostRef': {'hostId': cluster.primary_node.host_id}}
